@@ -11,67 +11,106 @@ on:
 
 env:
   package_name: qusb2snes
+  PUBLISH: false
+
+permissions:
+  contents: read
 
 jobs:
   update_package:
     runs-on: ubuntu-latest
     steps:
-      - name: Set up SSH key for external repository
-        run: |
-          mkdir -p ~/.ssh/
-          echo "${{ secrets.AUR_SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
-          chmod 600 ~/.ssh/id_rsa
-          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts
+      # Full history required: pkgver is r<commit-count>.<short-sha> from git rev-list /
+      # git rev-parse, and a shallow clone yields r1.<sha> — the version would go backwards.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
-      - name: Define target repository
+      - name: Determine target package and version
         run: |
-          if [[ ${{ github.ref_name }} == 'master' ]]; then
-            echo "REPO_NAME=${{ env.package_name }}-git" >> $GITHUB_ENV
+          if [[ "${{ github.ref_type }}" == 'tag' ]]; then
+            REPO_NAME="${{ env.package_name }}"
+            PKGVER="${{ github.ref_name }}"
+            PUBLISH=true
+          elif [[ "${{ github.event_name }}" == 'push' && "${{ github.ref_name }}" == "${{ github.event.repository.default_branch }}" ]]; then
+            REPO_NAME="${{ env.package_name }}-git"
+            PKGVER="r$(git rev-list --count HEAD).$(git rev-parse --short HEAD)"
+            PUBLISH=true
           else
-            echo "REPO_NAME=${{ env.package_name }}" >> $GITHUB_ENV
+            REPO_NAME="${{ env.package_name }}-git"
+            PKGVER="r$(git rev-list --count HEAD).$(git rev-parse --short HEAD)"
           fi
+          {
+            echo "REPO_NAME=$REPO_NAME"
+            echo "PKGVER=$PKGVER"
+            echo "PUBLISH=$PUBLISH"
+          } >> "$GITHUB_ENV"
 
-      - name: Clone external repository
-        run: |
-          git clone ssh://aur@aur.archlinux.org/${{ env.REPO_NAME }}.git
+      - name: Clone AUR repository
+        run: git clone --depth 1 "https://aur.archlinux.org/${{ env.REPO_NAME }}.git"
 
-      - name: Update PKGBUILD and .SRCINFO
+      - name: Update pkgver in PKGBUILD
+        working-directory: ${{ env.REPO_NAME }}
         run: |
-          PKGBUILD_PATH="PKGBUILD"
-          sed -E -i.bak "s/^([[:space:]]*)(pkgver)[[:space:]]*=[[:space:]]*.*/\1\2=${{github.ref_name}}/" $PKGBUILD_PATH
-          if grep -q "^[[:space:]]*pkgver=${{github.ref_name}}" "$PKGBUILD_PATH"; then
-            rm -f "${PKGBUILD_PATH}.bak"
-            echo "Updated $PKGBUILD_PATH: pkgver=${{github.ref_name}}"
-            cat "$PKGBUILD_PATH"
-          else
-            echo "Error: failed to update pkgver in $PKGBUILD_PATH" >&2
-            echo "Backup saved as ${PKGBUILD_PATH}.bak" >&2
+          set -euo pipefail
+          sed -E -i.bak \
+            "s/^([[:space:]]*pkgver[[:space:]]*=[[:space:]]*).*/\1${PKGVER}/" PKGBUILD
+          if ! grep -qE "^[[:space:]]*pkgver[[:space:]]*=[[:space:]]*${PKGVER}$" PKGBUILD; then
+            echo "::error file=PKGBUILD::failed to set pkgver=${PKGVER}"
+            diff -u PKGBUILD.bak PKGBUILD || true
             exit 3
           fi
-        working-directory: ${{ env.REPO_NAME }}
+          rm -f PKGBUILD.bak
 
-      - name: Update .SRCINFO
+      # Without a fragment, source=() leaves makepkg at upstream origin/HEAD, so this
+      # would validate master and pass for a PR that breaks it. #commit= pins the
+      # checkout to the PR sha, reachable from upstream via refs/pull/N/head; #branch=
+      # cannot work, as makepkg's `git clone -s` working copy carries no refs/pull/*.
+      # Rewriting the container's copy leaves the published PKGBUILD untouched.
+      - name: Validate PKGBUILD against PR head
+        if: ${{ github.event_name == 'pull_request' }}
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          SRCINFO_PATH=".SRCINFO"
-          sed -E -i.bak "s/^([[:space:]]*)(pkgver)[[:space:]]*=[[:space:]]*.*/\1\2=${{github.ref_name}}/" "$SRCINFO_PATH"
-          if grep -q "^[[:space:]]*pkgver=${{github.ref_name}}" "$SRCINFO_PATH"; then
-            rm -f "${SRCINFO_PATH}.bak"
-            echo "Updated $SRCINFO_PATH: pkgver=${{github.ref_name}}"
-            cat "$SRCINFO_PATH"
-          else
-            echo "Error: failed to update pkgver in $SRCINFO_PATH" >&2
-            echo "Backup saved as ${SRCINFO_PATH}.bak" >&2
-            exit 3
-          fi
-        working-directory: ${{ env.REPO_NAME }}
+          docker run --rm -e HEAD_SHA -v "$PWD/${REPO_NAME}":/pkg:ro archlinux:base-devel bash -c '
+            set -euo pipefail
+            pacman -Syu --noconfirm --needed git
+            useradd -m builder
+            cp -r /pkg /home/builder/pkg
+            sed -E -i \
+              "s|(git\+https://github.com/Skarsnik/QUsb2snes)\"|\1#commit=${HEAD_SHA}\"|" \
+              /home/builder/pkg/PKGBUILD
+            grep -q "#commit=${HEAD_SHA}" /home/builder/pkg/PKGBUILD
+            chown -R builder /home/builder/pkg
+            su builder -c "cd /home/builder/pkg && makepkg --nobuild --nodeps"
+          '
 
+      - name: Summarise result
+        working-directory: ${{ env.REPO_NAME }}
+        run: |
+          {
+            if [[ "${PUBLISH}" == 'true' ]]; then
+              echo "### Publishing \`${REPO_NAME}\` at \`${PKGVER}\`"
+            else
+              echo "### Dry run: \`${REPO_NAME}\` at \`${PKGVER}\` (nothing is pushed)"
+            fi
+            echo
+            echo '```diff'
+            git --no-pager diff -- PKGBUILD
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # No .SRCINFO step needed: the action copies only PKGBUILD into its own clone
+      # (build.sh L105), regenerates .SRCINFO via `makepkg --printsrcinfo` (L130-133)
+      # and stages both (L146).
       - name: Push to AUR
-        uses: KSXGitHub/github-actions-deploy-aur@v4.1.1
+        if: ${{ env.PUBLISH == 'true' }}
+        uses: KSXGitHub/github-actions-deploy-aur@v4.2.0
         with:
           pkgname: ${{ env.REPO_NAME }}
           pkgbuild: ${{ env.REPO_NAME }}/PKGBUILD
           commit_username: ${{ secrets.AUR_USERNAME }}
           commit_email: ${{ secrets.AUR_EMAIL }}
           ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
-          commit_message: Update AUR package
+          commit_message: Update AUR package to ${{ env.PKGVER }}
           ssh_keyscan_types: rsa,ecdsa,ed25519
